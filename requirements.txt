@@ -1,0 +1,10 @@
+# CLI Requirements for DeepScientist Prototype
+
+click==8.1.7
+python-socketio==5.10.0
+websocket-client>=1.8.0  # Required for WebSocket transport
+gitingest==0.3.1
+requests==2.31.0
+prompt_toolkit==3.0.47
+pyperclip==1.8.2
+rich>=13.0.0
