@@ -8,7 +8,6 @@
 
 The DeepScientist CLI empowers researchers to harness the full potential of autonomous scientific discovery without the prohibitive setup overhead. It democratizes access to the state-of-the-art DeepScientist system by encapsulating its complex operational requirements into intuitive commands. This tool is designed to accelerate the research lifecycle, allowing users to seamlessly submit tasks, monitor progress, and iterate on ideas at a scale previously reserved for highly specialized teams.
 
-The current public release is v0.2.1, and the bundled backend handshake checks the same version to keep the CLI and server in sync.
 
 ## Prerequisites
 
