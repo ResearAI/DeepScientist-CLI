@@ -84,7 +84,7 @@ The installer performs the following steps (mirroring `install_cli.sh`):
    - If verification succeeds, the script automatically runs `deepscientist_cli.py login` so your token is saved in `~/.deepscientist/cli_config.json`.  
    - Supported (institutional) users are asked whether to use DeepScientist-provided Claude Code resources or their own Anthropic API key. Normal users default to local configuration.
 5. Installs Claude Code tooling via `src/claude_code_deepscientist_env.sh`, configuring the appropriate API endpoint when DeepScientist resources are selected.
-6. Writes installation metadata (including version `v0.2.1`) to both the installation directory and `~/.deepscientist/config.json`.
+6. Writes installation metadata (including version `v0.3.0`) to both the installation directory and `~/.deepscientist/config.json`.
 7. Appends the installation paths to your shell profile (`.bashrc` or `.zshrc`) if they are not already present.
 8. Reminds you at completion that you can launch the CLI with `deepscientist-cli` or `ds-cli`.
 
