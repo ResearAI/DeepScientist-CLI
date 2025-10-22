@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-# deepscientist_cli.py - Enhanced CLI with Claude Code style
+# deepscientist_cli_enhanced.py - Enhanced CLI with Claude Code style
 """
-DeepScientist CLI - Professional Research Platform CLI
+DeepScientistCLI Enhanced - Professional Research Platform CLI
 
+Features:
+- Task management (pause/resume/delete/list)
+- Heartbeat system with 24h timeout
+- Findings viewer
+- Enhanced UI with Claude Code style
+- In-execution controls (pause/resume/stop)
 """
 
 import ast
@@ -72,7 +78,7 @@ except ImportError:
     PROMPT_TOOLKIT_AVAILABLE = False
 
 # Global variables
-CLI_VERSION = "v0.3.0"
+CLI_VERSION = "v0.3.1"
 VERSION_CHECK_ENDPOINT = "/api/version/latest"
 VERSION_CHECK_TIMEOUT = 3
 SERVER_URL = "http://deepscientist.ai-researcher.net:8888"
@@ -1012,7 +1018,7 @@ def compute_dashboard_url(
     task_id = task_id or task_status.get('task_id')
     token = token or task_status.get('token')
     server = server or task_status.get('server')
-    prompt = 'DeepScientist'
+    prompt = prompt or task_status.get('query') or 'DeepScientist'
     backend_api = _derive_backend_api_url(server)
     if not (task_id and backend_api and token):
         return None
@@ -7115,7 +7121,7 @@ def submit(codebase_path, token, server, query, gpu, baseline):
 
         # Start monitoring
         console.print("[bold green]✓ Now monitoring task in real-time[/bold green]")
-        console.print("[dim]Task will continue for up to 24 hours or until completion[/dim]")
+        console.print("[dim]Task will continue until completion or timeout (configured by admin)[/dim]")
         console.print("[dim]Type '/q' or '/quit' + Enter to terminate | Ctrl+C to exit monitoring[/dim]\n")
 
         # UI monitoring with command input support
@@ -7226,12 +7232,7 @@ def submit(codebase_path, token, server, query, gpu, baseline):
 
                 time.sleep(0.5)
 
-                # Check for 24h timeout
-                if task_status['start_time']:
-                    elapsed = (datetime.now() - task_status['start_time']).total_seconds()
-                    if elapsed > 86400:  # 24 hours
-                        console.print("\n[yellow]⏰ 24-hour timeout reached[/yellow]")
-                        break
+                # No client-side timeout check - backend handles all timeouts
         except KeyboardInterrupt:
             # Restore terminal to normal state
             console.print("\n\n[yellow]⚠️  Monitoring stopped (task continues in background)[/yellow]")
