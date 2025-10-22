@@ -4,19 +4,17 @@
 
 ⚠️ **This CLI is intended only for users who already hold a valid DeepScientist API token from http://deepscientist.cc.**
 
-![image.png](img/ds-cli.png)
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=OJodfU__Buk">
+    <img src="img/ds-cli.png" alt="Watch the video">
+  </a>
+</p>
 
 ## Overview
 
 The DeepScientist CLI empowers researchers to harness the full potential of autonomous scientific discovery without the prohibitive setup overhead. It democratizes access to the state-of-the-art DeepScientist system by encapsulating its complex operational requirements into intuitive commands. This tool is designed to accelerate the research lifecycle, allowing users to seamlessly submit tasks, monitor progress, and iterate on ideas at a scale previously reserved for highly specialized teams.
 
-<object width="425" height="350">
-  <param name="movie" value="http://www.youtube.com/user/wwwLoveWatercom?v=OJodfU__Buk" />
-  <param name="wmode" value="transparent" />
-  <embed src="http://www.youtube.com/user/wwwLoveWatercom?v=OJodfU__Buk"
-         type="application/x-shockwave-flash"
-         wmode="transparent" width="425" height="350" />
-</object>
+
 
 ## Prerequisites
 
