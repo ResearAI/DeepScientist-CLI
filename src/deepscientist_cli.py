@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
-# deepscientist_cli_enhanced.py - Enhanced CLI with Claude Code style
+# deepscientist_cli.py - Enhanced CLI with Claude Code style
 """
-DeepScientistCLI Enhanced - Professional Research Platform CLI
-
-Features:
-- Task management (pause/resume/delete/list)
-- Heartbeat system with 24h timeout
-- Findings viewer
-- Enhanced UI with Claude Code style
-- In-execution controls (pause/resume/stop)
+DeepScientistCLI - Professional Research Platform CLI
 """
 
 import ast
@@ -1018,7 +1011,7 @@ def compute_dashboard_url(
     task_id = task_id or task_status.get('task_id')
     token = token or task_status.get('token')
     server = server or task_status.get('server')
-    prompt = prompt or task_status.get('query') or 'DeepScientist'
+    prompt = 'DeepScientist'
     backend_api = _derive_backend_api_url(server)
     if not (task_id and backend_api and token):
         return None
