@@ -71,7 +71,7 @@ except ImportError:
     PROMPT_TOOLKIT_AVAILABLE = False
 
 # Global variables
-CLI_VERSION = "v0.3.1"
+CLI_VERSION = "v0.3.2"
 VERSION_CHECK_ENDPOINT = "/api/version/latest"
 VERSION_CHECK_TIMEOUT = 3
 SERVER_URL = "http://deepscientist.ai-researcher.net:8888"
@@ -436,15 +436,16 @@ class ClaudeCodeStreamProcessor:
             while True:
                 # Check stop flag every iteration (includes timeout checks)
                 current_time = time_module.time()
-                if control_flags.get('stop_requested', False):
-                    logging.info("Stop requested - terminating Claude Code process")
+                if control_flags.get('stop_requested', False) or control_flags.get('should_exit', False):
+                    reason = "server termination" if control_flags.get('should_exit', False) else "user request (/q command)"
+                    logging.info(f"Stop requested - terminating Claude Code process (reason: {reason})")
                     proc.terminate()
                     try:
                         proc.wait(timeout=5.0)
                     except subprocess.TimeoutExpired:
                         proc.kill()
                         proc.wait()
-                    raise KeyboardInterrupt("Execution stopped by user request (/q command)")
+                    raise KeyboardInterrupt(f"Execution stopped by {reason}")
 
                 # Check if process is still alive
                 if proc.poll() is not None:
@@ -961,6 +962,8 @@ task_status = {
     'token_count': 0,
     'findings_count': 0,
     'query': None,
+    'terminated_by_server': False,  # Flag for server-initiated termination
+    'termination_message': None,
     'cuda_device': None,
     'total_llm_tokens': 0,
     'total_prompt_tokens': 0,
@@ -1058,6 +1061,7 @@ control_flags = {
     'user_input_mode': False,
     'force_ui_update': False,  # Force immediate UI update on important events
     'final_summary_ready': False,
+    'should_exit': False,  # Signal for immediate exit (CTRL+C style)
 }
 
 ui_state = {
@@ -1633,7 +1637,11 @@ def save_cli_config(config):
         'conda',
         'validation_frequency',
         'baseline_upload',
-        'last_login_at'
+        'last_login_at',
+        'claude_code_max_retries',
+        'test_sh_max_retries',
+        'reconnection_attempts',
+        'heartbeat_interval'
     ]
 
     for key in keys_to_sync:
@@ -1930,6 +1938,38 @@ def resolve_server(server_option):
     if stored:
         return normalize_server_url(stored)
     return normalize_server_url(SERVER_URL)
+
+
+def get_retry_config():
+    """Get retry configuration with default values.
+
+    Returns:
+        dict: {
+            'claude_code_max_retries': int (default: 2),
+            'test_sh_max_retries': int (default: 1)
+        }
+    """
+    config = load_cli_config()
+    return {
+        'claude_code_max_retries': config.get('claude_code_max_retries', 2),
+        'test_sh_max_retries': config.get('test_sh_max_retries', 1)
+    }
+
+
+def get_connection_config():
+    """Get WebSocket connection configuration from config file
+
+    Returns:
+        dict: {
+            'reconnection_attempts': int (default: 400, ~1 hour with 10s max delay),
+            'heartbeat_interval': int (default: 1800, 30 minutes in seconds)
+        }
+    """
+    config = load_cli_config()
+    return {
+        'reconnection_attempts': config.get('reconnection_attempts', 400),
+        'heartbeat_interval': config.get('heartbeat_interval', 1800)
+    }
 
 
 def resolve_token(token_option, server):
@@ -3457,7 +3497,7 @@ def generate_enhanced_ui():
         header_content = Table(show_header=False, box=None, padding=(0, 1), expand=True)
         header_content.add_column("Info", style="cyan", justify="left", no_wrap=False)
 
-        # Build connection status
+        # Build connection status with enhanced reconnection info
         if task_status['connected']:
             heartbeat_status = "💚 OK" if task_status['heartbeat_ok'] else "❤️ Sending..."
             heartbeat_next = task_status.get('heartbeat_next', 'N/A')
@@ -3467,7 +3507,15 @@ def generate_enhanced_ui():
                 next_str = 'N/A'
             connection_text = f"[green]● Connected[/green] | Heartbeat: {heartbeat_status} (next: {next_str}) | Ctrl+C: exit | Ctrl+Q: terminate"
         else:
-            connection_text = "[yellow]○ Disconnected[/yellow] | Reconnecting... | Ctrl+C: exit | Ctrl+Q: terminate"
+            # Show reconnection progress
+            reconnect_count = task_status.get('reconnection_count', 0)
+            disconnect_start = task_status.get('disconnection_start')
+            if disconnect_start and isinstance(disconnect_start, datetime):
+                elapsed = (datetime.now() - disconnect_start).total_seconds()
+                elapsed_str = f"{int(elapsed)}s"
+            else:
+                elapsed_str = "0s"
+            connection_text = f"[yellow]○ Disconnected[/yellow] | Reconnecting (attempt #{reconnect_count}, elapsed: {elapsed_str}, max: 1h) | Ctrl+C: exit"
 
         # Broadcast row (if any) - shown first in red
         if task_status['broadcasts']:
@@ -3718,12 +3766,20 @@ def generate_enhanced_ui():
 
 
 def create_websocket_client(server, token):
-    """Create and configure WebSocket client"""
+    """Create and configure WebSocket client with robust reconnection (configurable)"""
+    # Get connection configuration from config file
+    conn_config = get_connection_config()
+    reconnection_attempts = conn_config['reconnection_attempts']
+
+    # Calculate expected max reconnection time based on attempts
+    # With max delay of 10s, max_time ≈ attempts * 10s / 60 = minutes
+    max_minutes = (reconnection_attempts * 10) // 60
+
     sio = socketio.Client(
         reconnection=True,
-        reconnection_attempts=10,
-        reconnection_delay=2,
-        reconnection_delay_max=10
+        reconnection_attempts=reconnection_attempts,  # Configurable (default: 400 for ~1 hour)
+        reconnection_delay=2,        # Start with 2 seconds
+        reconnection_delay_max=10    # Cap at 10 seconds between attempts
     )
 
     # Create Event object for task_created signal (thread-safe)
@@ -3735,22 +3791,60 @@ def create_websocket_client(server, token):
 
     @sio.on('connect')
     def on_connect():
+        """Handle connection/reconnection to server"""
+        was_disconnected = not task_status.get('connected', False)
         task_status['connected'] = True
-        task_status['events'].append({
-            'timestamp': datetime.now().isoformat(),
-            'type': 'activity',
-            'title': '✅ Connected to server'
-        })
+        task_status['reconnection_count'] = task_status.get('reconnection_count', 0)
+        task_status['disconnection_start'] = None  # Clear disconnection timestamp
+
+        if was_disconnected and task_status.get('reconnection_count', 0) > 0:
+            # This is a reconnection
+            task_status['events'].append({
+                'timestamp': datetime.now().isoformat(),
+                'type': 'activity',
+                'title': f'✅ Reconnected to server (attempt #{task_status["reconnection_count"]})'
+            })
+
+            # Automatically rejoin task room if we have a task_id
+            if task_status.get('task_id'):
+                try:
+                    sio.emit('join_task', {
+                        'task_id': task_status['task_id'],
+                        'token': token
+                    })
+                    task_status['events'].append({
+                        'timestamp': datetime.now().isoformat(),
+                        'type': 'activity',
+                        'title': f'🔄 Rejoined task room: {task_status["task_id"]}'
+                    })
+                except Exception as e:
+                    task_status['events'].append({
+                        'timestamp': datetime.now().isoformat(),
+                        'type': 'activity',
+                        'title': f'⚠️  Failed to rejoin task room: {str(e)}'
+                    })
+        else:
+            # Initial connection
+            task_status['events'].append({
+                'timestamp': datetime.now().isoformat(),
+                'type': 'activity',
+                'title': '✅ Connected to server'
+            })
+
         clamp_event_scroll()
         control_flags['force_ui_update'] = True
 
     @sio.on('disconnect')
     def on_disconnect():
+        """Handle disconnection from server"""
         task_status['connected'] = False
+        task_status['reconnection_count'] = task_status.get('reconnection_count', 0) + 1
+        task_status['disconnection_start'] = datetime.now()
+
         task_status['events'].append({
             'timestamp': datetime.now().isoformat(),
             'type': 'activity',
-            'title': '⚠️  Disconnected from server'
+            'title': '⚠️  Disconnected from server - attempting to reconnect (will retry for up to 1 hour)...'
         })
         clamp_event_scroll()
         control_flags['force_ui_update'] = True
@@ -3920,6 +4014,48 @@ def create_websocket_client(server, token):
 
         clamp_event_scroll()
         control_flags['force_ui_update'] = True
+
+    @sio.on('task_terminated')
+    def on_task_terminated(data):
+        """Handle server-initiated task termination"""
+        message = data.get('message', 'Task has been terminated by server')
+        task_id = data.get('task_id')
+        retry_num = data.get('retry', 0)
+
+        task_status['terminated_by_server'] = True
+        task_status['termination_message'] = message
+        task_status['status'] = 'terminated'
+
+        # Add termination event to event log
+        task_status['events'].append({
+            'timestamp': datetime.now().isoformat(),
+            'type': 'system',
+            'title': '🛑 Task Terminated',
+            'description': message,
+        })
+
+        clamp_event_scroll()
+        control_flags['force_ui_update'] = True
+        control_flags['should_exit'] = True  # Signal to exit main loop
+
+        # Log termination
+        task_status['claude_logs'].append({
+            'timestamp': datetime.now().isoformat(),
+            'type': 'system',
+            'formatted': f'[red]🛑 Task Terminated: {message}[/red]'
+        })
+
+        # Send confirmation to backend (only on first receipt, not retries)
+        if retry_num == 0:
+            try:
+                sio.emit('task_termination_confirmed', {
+                    'task_id': task_id or task_status.get('task_id'),
+                    'token': token,
+                    'timestamp': datetime.now().isoformat()
+                })
+                print(f"✅ Sent termination confirmation to backend for task {task_id}")
+            except Exception as e:
+                print(f"⚠️ Failed to send termination confirmation: {e}")
 
     @sio.on('task_update')
     def on_task_update(data):
@@ -4110,6 +4246,11 @@ def create_websocket_client(server, token):
                 else:
                     cuda_instruction = f'Use conda activate {conda_env}. Before running any CUDA operations, please use nvidia-smi to check available GPUs and automatically select an available GPU by setting CUDA_VISIBLE_DEVICES=<selected_gpu_id>. Must run the test.sh code, do not skip or stop. if stop, please restart the process.'
 
+                # Get retry configuration
+                retry_config = get_retry_config()
+                claude_code_max_retries = retry_config.get('claude_code_max_retries', 2)
+                test_sh_max_retries = retry_config.get('test_sh_max_retries', 1)
+
                 # Build prompts for two-phase execution
                 base_directive = (
                     '\nPlease implement the IDEA in the codebase. \n\n\n'
@@ -4229,10 +4370,12 @@ def create_websocket_client(server, token):
 
                 print(f"\n{'='*80}")
                 print(f"🛠️  PHASE 1/2: Initial Implementation (without test.sh) - {idea_id}")
+                print(f"   Max retries: {claude_code_max_retries} (total {claude_code_max_retries + 1} attempts)")
                 print(f"{'='*80}\n")
 
                 combined_logger.log_message("="*80, "SYSTEM")
                 combined_logger.log_message("=== CLAUDE CODE CALL 1/2: INITIAL IMPLEMENTATION ===", "SYSTEM")
+                combined_logger.log_message(f"Max retries configured: {claude_code_max_retries}", "SYSTEM")
                 combined_logger.log_message("="*80, "SYSTEM")
 
                 # Clear claude_logs at the start
@@ -4240,56 +4383,109 @@ def create_websocket_client(server, token):
                 control_flags['force_ui_update'] = True
                 clamp_event_scroll()
 
-                # Build command for Phase 1
-                phase1_command = [
-                    'claude',
-                    '--output-format', 'stream-json',
-                    '-p',
-                    '--dangerously-skip-permissions',
-                    '--verbose',
-                    phase1_prompt
-                ]
+                # Retry loop for Phase 1
+                phase1_return_code = 1
+                phase1_attempt = 0
 
-                # Create manager for Phase 1
-                manager1 = ClaudeCodeStreamManager(
-                    show_types={'assistant', 'user', 'result', 'system'},
-                    show_tools=True,
-                    cwd=str(impl_dir),
-                    cuda_device=cuda_device
-                )
-                manager1.processor = ClaudeCodeStreamProcessor(
-                    cwd=str(impl_dir),
-                    cuda_device=cuda_device,
-                    combined_logger=combined_logger
-                )
+                while phase1_attempt <= claude_code_max_retries:
+                    phase1_attempt += 1
 
-                phase1_return_code = 0
-                try:
-                    manager1.process_claude_stream(phase1_command)
-                except KeyboardInterrupt:
-                    # User requested stop via /q command - propagate immediately
-                    print(f"\n⚠️  Phase 1 stopped by user request (/q command)")
+                    # Determine if this is a retry attempt
+                    is_retry = phase1_attempt > 1
+
+                    # Build current attempt prompt (add retry reminder for retries)
+                    current_phase1_prompt = phase1_prompt
+                    if is_retry:
+                        retry_reminder = (
+                            "\n\n--------********-------\n\n"
+                            "**IMPORTANT - THIS IS A RETRY ATTEMPT**: "
+                            "This is a retry attempt. The previous execution encountered an unknown error and was terminated. "
+                            "Please continue with the current task. First, make a complete plan for the current task. "
+                            "If you find some code has already been modified, you can skip it and proceed with further plans. "
+                            "Only stop when all tasks in the current command are completed."
+                        )
+                        current_phase1_prompt = phase1_prompt + retry_reminder
+
+                    # Log attempt information
+                    attempt_msg = f"Attempt {phase1_attempt}/{claude_code_max_retries + 1}" + (" (RETRY)" if is_retry else " (INITIAL)")
+                    print(f"\n{'─'*60}")
+                    print(f"🔄 {attempt_msg}")
+                    print(f"{'─'*60}\n")
+
                     combined_logger.log_message("="*60, "SYSTEM")
-                    combined_logger.log_message("Phase 1 stopped by user request (/q command)", "SYSTEM")
+                    combined_logger.log_message(f"=== Phase 1 {attempt_msg} ===", "SYSTEM")
                     combined_logger.log_message("="*60, "SYSTEM")
-                    raise  # Re-raise to stop execution completely
-                except Exception as e:
-                    import traceback as tb
-                    error_str = str(e)
-                    if "Pre-flight check" in error_str or "BashTool" in error_str:
-                        print(f"\n❌ Claude Code API pre-flight check failed!")
-                        print(f"   This usually means:")
-                        print(f"   1. ANTHROPIC_API_KEY is not set or invalid")
-                        print(f"   2. Network connection to api.anthropic.com is blocked")
-                        print(f"   3. Claude API service is experiencing issues")
-                    else:
-                        print(f"❌ Phase 1 Claude Code execution error: {e}")
-                    phase1_return_code = 1
-                    combined_logger.log_message("="*60, "ERROR")
-                    combined_logger.log_message("ERROR: Phase 1 Claude Code execution failed", "ERROR")
-                    combined_logger.log_message(f"Exception: {e}", "ERROR")
-                    combined_logger.log_message(f"Traceback:\n{tb.format_exc()}", "ERROR")
-                    combined_logger.log_message("="*60, "ERROR")
+
+                    # Build command for Phase 1
+                    phase1_command = [
+                        'claude',
+                        '--output-format', 'stream-json',
+                        '-p',
+                        '--dangerously-skip-permissions',
+                        '--verbose',
+                        current_phase1_prompt
+                    ]
+
+                    # Create manager for Phase 1
+                    manager1 = ClaudeCodeStreamManager(
+                        show_types={'assistant', 'user', 'result', 'system'},
+                        show_tools=True,
+                        cwd=str(impl_dir),
+                        cuda_device=cuda_device
+                    )
+                    manager1.processor = ClaudeCodeStreamProcessor(
+                        cwd=str(impl_dir),
+                        cuda_device=cuda_device,
+                        combined_logger=combined_logger
+                    )
+
+                    try:
+                        manager1.process_claude_stream(phase1_command)
+                        # Success!
+                        phase1_return_code = 0
+                        print(f"\n✅ Phase 1 {attempt_msg} completed successfully")
+                        combined_logger.log_message(f"=== Phase 1 {attempt_msg} SUCCEEDED ===", "SYSTEM")
+                        break  # Exit retry loop on success
+
+                    except KeyboardInterrupt:
+                        # User requested stop via /q command - propagate immediately
+                        print(f"\n⚠️  Phase 1 stopped by user request (/q command)")
+                        combined_logger.log_message("="*60, "SYSTEM")
+                        combined_logger.log_message("Phase 1 stopped by user request (/q command)", "SYSTEM")
+                        combined_logger.log_message("="*60, "SYSTEM")
+                        raise  # Re-raise to stop execution completely
+
+                    except Exception as e:
+                        import traceback as tb
+                        error_str = str(e)
+
+                        # Log the error
+                        if "Pre-flight check" in error_str or "BashTool" in error_str:
+                            print(f"\n❌ Claude Code API pre-flight check failed!")
+                            print(f"   This usually means:")
+                            print(f"   1. ANTHROPIC_API_KEY is not set or invalid")
+                            print(f"   2. Network connection to api.anthropic.com is blocked")
+                            print(f"   3. Claude API service is experiencing issues")
+                        else:
+                            print(f"❌ Phase 1 {attempt_msg} error: {e}")
+
+                        phase1_return_code = 1
+                        combined_logger.log_message("="*60, "ERROR")
+                        combined_logger.log_message(f"ERROR: Phase 1 {attempt_msg} failed", "ERROR")
+                        combined_logger.log_message(f"Exception: {e}", "ERROR")
+                        combined_logger.log_message(f"Traceback:\n{tb.format_exc()}", "ERROR")
+                        combined_logger.log_message("="*60, "ERROR")
+
+                        # Check if we should retry
+                        if phase1_attempt <= claude_code_max_retries:
+                            retry_msg = f"Will retry... ({claude_code_max_retries - phase1_attempt + 1} retries remaining)"
+                            print(f"\n🔄 {retry_msg}")
+                            combined_logger.log_message(retry_msg, "SYSTEM")
+                        else:
+                            # All retries exhausted
+                            final_msg = f"All {claude_code_max_retries + 1} attempts failed. No more retries available."
+                            print(f"\n❌ {final_msg}")
+                            combined_logger.log_message(final_msg, "ERROR")
 
                 combined_logger.log_message("="*80, "SYSTEM")
                 combined_logger.log_message(f"=== PHASE 1/2 COMPLETED (return code: {phase1_return_code}) ===", "SYSTEM")
@@ -4308,55 +4504,107 @@ def create_websocket_client(server, token):
 
                 print(f"\n{'='*80}")
                 print(f"🛠️  PHASE 2/2: Finalization & Testing (method rename + test.sh) - {idea_id}")
+                print(f"   Max retries: {claude_code_max_retries} (total {claude_code_max_retries + 1} attempts)")
                 print(f"{'='*80}\n")
 
                 combined_logger.log_message("\n\n--------********-------\n", "SYSTEM")
                 combined_logger.log_message("="*80, "SYSTEM")
                 combined_logger.log_message("=== CLAUDE CODE CALL 2/2: FINALIZATION & TESTING ===", "SYSTEM")
+                combined_logger.log_message(f"Max retries configured: {claude_code_max_retries}", "SYSTEM")
                 combined_logger.log_message("="*80, "SYSTEM")
 
-                # Build command for Phase 2
-                phase2_command = [
-                    'claude',
-                    '--output-format', 'stream-json',
-                    '-p',
-                    '--dangerously-skip-permissions',
-                    '--verbose',
-                    phase2_prompt
-                ]
+                # Retry loop for Phase 2
+                phase2_return_code = 1
+                phase2_attempt = 0
 
-                # Create manager for Phase 2
-                manager2 = ClaudeCodeStreamManager(
-                    show_types={'assistant', 'user', 'result', 'system'},
-                    show_tools=True,
-                    cwd=str(impl_dir),
-                    cuda_device=cuda_device
-                )
-                manager2.processor = ClaudeCodeStreamProcessor(
-                    cwd=str(impl_dir),
-                    cuda_device=cuda_device,
-                    combined_logger=combined_logger
-                )
+                while phase2_attempt <= claude_code_max_retries:
+                    phase2_attempt += 1
 
-                phase2_return_code = 0
-                try:
-                    manager2.process_claude_stream(phase2_command)
-                except KeyboardInterrupt:
-                    # User requested stop via /q command - propagate immediately
-                    print(f"\n⚠️  Phase 2 stopped by user request (/q command)")
+                    # Determine if this is a retry attempt
+                    is_retry = phase2_attempt > 1
+
+                    # Build current attempt prompt (add retry reminder for retries)
+                    current_phase2_prompt = phase2_prompt
+                    if is_retry:
+                        retry_reminder = (
+                            "\n\n--------********-------\n\n"
+                            "**IMPORTANT - THIS IS A RETRY ATTEMPT**: "
+                            "This is a retry attempt. The previous execution encountered an unknown error and was terminated. "
+                            "Please continue with the current task. First, make a complete plan for the current task. "
+                            "If you find some code has already been modified, you can skip it and proceed with further plans. "
+                            "Only stop when all tasks in the current command are completed."
+                        )
+                        current_phase2_prompt = phase2_prompt + retry_reminder
+
+                    # Log attempt information
+                    attempt_msg = f"Attempt {phase2_attempt}/{claude_code_max_retries + 1}" + (" (RETRY)" if is_retry else " (INITIAL)")
+                    print(f"\n{'─'*60}")
+                    print(f"🔄 {attempt_msg}")
+                    print(f"{'─'*60}\n")
+
                     combined_logger.log_message("="*60, "SYSTEM")
-                    combined_logger.log_message("Phase 2 stopped by user request (/q command)", "SYSTEM")
+                    combined_logger.log_message(f"=== Phase 2 {attempt_msg} ===", "SYSTEM")
                     combined_logger.log_message("="*60, "SYSTEM")
-                    raise  # Re-raise to stop execution completely
-                except Exception as e:
-                    import traceback as tb
-                    print(f"❌ Phase 2 Claude Code execution error: {e}")
-                    phase2_return_code = 1
-                    combined_logger.log_message("="*60, "ERROR")
-                    combined_logger.log_message("ERROR: Phase 2 Claude Code execution failed", "ERROR")
-                    combined_logger.log_message(f"Exception: {e}", "ERROR")
-                    combined_logger.log_message(f"Traceback:\n{tb.format_exc()}", "ERROR")
-                    combined_logger.log_message("="*60, "ERROR")
+
+                    # Build command for Phase 2
+                    phase2_command = [
+                        'claude',
+                        '--output-format', 'stream-json',
+                        '-p',
+                        '--dangerously-skip-permissions',
+                        '--verbose',
+                        current_phase2_prompt
+                    ]
+
+                    # Create manager for Phase 2
+                    manager2 = ClaudeCodeStreamManager(
+                        show_types={'assistant', 'user', 'result', 'system'},
+                        show_tools=True,
+                        cwd=str(impl_dir),
+                        cuda_device=cuda_device
+                    )
+                    manager2.processor = ClaudeCodeStreamProcessor(
+                        cwd=str(impl_dir),
+                        cuda_device=cuda_device,
+                        combined_logger=combined_logger
+                    )
+
+                    try:
+                        manager2.process_claude_stream(phase2_command)
+                        # Success!
+                        phase2_return_code = 0
+                        print(f"\n✅ Phase 2 {attempt_msg} completed successfully")
+                        combined_logger.log_message(f"=== Phase 2 {attempt_msg} SUCCEEDED ===", "SYSTEM")
+                        break  # Exit retry loop on success
+
+                    except KeyboardInterrupt:
+                        # User requested stop via /q command - propagate immediately
+                        print(f"\n⚠️  Phase 2 stopped by user request (/q command)")
+                        combined_logger.log_message("="*60, "SYSTEM")
+                        combined_logger.log_message("Phase 2 stopped by user request (/q command)", "SYSTEM")
+                        combined_logger.log_message("="*60, "SYSTEM")
+                        raise  # Re-raise to stop execution completely
+
+                    except Exception as e:
+                        import traceback as tb
+                        print(f"❌ Phase 2 {attempt_msg} error: {e}")
+                        phase2_return_code = 1
+                        combined_logger.log_message("="*60, "ERROR")
+                        combined_logger.log_message(f"ERROR: Phase 2 {attempt_msg} failed", "ERROR")
+                        combined_logger.log_message(f"Exception: {e}", "ERROR")
+                        combined_logger.log_message(f"Traceback:\n{tb.format_exc()}", "ERROR")
+                        combined_logger.log_message("="*60, "ERROR")
+
+                        # Check if we should retry
+                        if phase2_attempt <= claude_code_max_retries:
+                            retry_msg = f"Will retry... ({claude_code_max_retries - phase2_attempt + 1} retries remaining)"
+                            print(f"\n🔄 {retry_msg}")
+                            combined_logger.log_message(retry_msg, "SYSTEM")
+                        else:
+                            # All retries exhausted
+                            final_msg = f"All {claude_code_max_retries + 1} attempts failed. No more retries available."
+                            print(f"\n❌ {final_msg}")
+                            combined_logger.log_message(final_msg, "ERROR")
 
                 combined_logger.log_message("="*80, "SYSTEM")
                 combined_logger.log_message(f"=== PHASE 2/2 COMPLETED (return code: {phase2_return_code}) ===", "SYSTEM")
@@ -4365,79 +4613,135 @@ def create_websocket_client(server, token):
                 # Overall return code
                 claude_return_code = max(phase1_return_code, phase2_return_code)
 
-                # Phase 2: Run test.sh
+                # Phase 2: Run test.sh with retry logic
                 test_script = impl_dir / 'test.sh'
                 test_output_lines = []
 
                 print(f"\n{'='*60}")
-                print(f"🧪 PHASE 2: Running test.sh - {idea_id}")
+                print(f"🧪 Running test.sh - {idea_id}")
+                print(f"   Max retries: {test_sh_max_retries} (total {test_sh_max_retries + 1} attempts)")
                 print(f"{'='*60}\n")
 
-                combined_logger.log_message("=== PHASE 2: Running test.sh ===", "SYSTEM")
+                combined_logger.log_message("="*80, "SYSTEM")
+                combined_logger.log_message("=== Running test.sh ===", "SYSTEM")
                 combined_logger.log_message(f"Test script path: {test_script}", "SYSTEM")
                 combined_logger.log_message(f"Working directory: {impl_dir}", "SYSTEM")
+                combined_logger.log_message(f"Max retries configured: {test_sh_max_retries}", "SYSTEM")
+                combined_logger.log_message("="*80, "SYSTEM")
+
+                success = False
+                test_return_code = 1
 
                 if test_script.exists():
-                    task_status['events'].append({
-                        'timestamp': datetime.now().isoformat(),
-                        'type': 'implementation',
-                        'title': f'🧪 Running test.sh for {idea_id}'
-                    })
-                    control_flags['force_ui_update'] = True
-                    clamp_event_scroll()
+                    # Retry loop for test.sh
+                    test_attempt = 0
 
-                    # Run test.sh - capture both stdout and stderr
-                    # Use pre-configured conda activation command
-                    conda_activate = get_conda_activate_command()
-                    test_command = f"{conda_activate} && bash test.sh"
-                    try:
-                        test_process = subprocess.Popen(
-                            ['bash', '-c', test_command],
-                            cwd=impl_dir,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            universal_newlines=True,
-                            text=True,
-                            env=env,
-                            bufsize=1
-                        )
+                    while test_attempt <= test_sh_max_retries:
+                        test_attempt += 1
 
-                        # Read stdout
-                        for line in test_process.stdout:
-                            test_output_lines.append(line.rstrip())
-                            print(line, end='', flush=True)  # Display in real-time
-                            combined_logger.log_message(line.rstrip(), "TEST", print_to_console=False)
+                        # Clear output lines for new attempt
+                        test_output_lines = []
 
-                        test_process.wait()
-                        test_return_code = test_process.returncode
+                        # Determine if this is a retry attempt
+                        is_retry = test_attempt > 1
 
-                        # Read stderr after process completes
-                        stderr_output = test_process.stderr.read()
-                        if stderr_output:
-                            combined_logger.log_message("--- STDERR OUTPUT ---", "TEST")
-                            combined_logger.log_message(stderr_output, "TEST", print_to_console=False)
-                            combined_logger.log_message("--- END STDERR ---", "TEST")
-                            test_output_lines.append("--- STDERR OUTPUT ---")
-                            test_output_lines.extend(stderr_output.strip().split('\n'))
-                            test_output_lines.append("--- END STDERR ---")
-                            print(f"\n[STDERR]\n{stderr_output}")
+                        # Log attempt information
+                        attempt_msg = f"Attempt {test_attempt}/{test_sh_max_retries + 1}" + (" (RETRY)" if is_retry else " (INITIAL)")
+                        print(f"\n{'─'*60}")
+                        print(f"🔄 test.sh {attempt_msg}")
+                        print(f"{'─'*60}\n")
 
-                        combined_logger.log_message(f"=== PHASE 2 COMPLETED (return code: {test_return_code}) ===", "SYSTEM")
+                        combined_logger.log_message("="*60, "SYSTEM")
+                        combined_logger.log_message(f"=== test.sh {attempt_msg} ===", "SYSTEM")
+                        combined_logger.log_message("="*60, "SYSTEM")
 
-                        if test_return_code != 0:
-                            combined_logger.log_message(f"WARNING: test.sh exited with non-zero code: {test_return_code}", "WARNING")
+                        task_status['events'].append({
+                            'timestamp': datetime.now().isoformat(),
+                            'type': 'implementation',
+                            'title': f'🧪 Running test.sh for {idea_id} - {attempt_msg}'
+                        })
+                        control_flags['force_ui_update'] = True
+                        clamp_event_scroll()
+
+                        # Run test.sh - capture both stdout and stderr
+                        # Use pre-configured conda activation command
+                        conda_activate = get_conda_activate_command()
+                        test_command = f"{conda_activate} && bash test.sh"
+                        try:
+                            test_process = subprocess.Popen(
+                                ['bash', '-c', test_command],
+                                cwd=impl_dir,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                universal_newlines=True,
+                                text=True,
+                                env=env,
+                                bufsize=1
+                            )
+
+                            # Read stdout
+                            for line in test_process.stdout:
+                                test_output_lines.append(line.rstrip())
+                                print(line, end='', flush=True)  # Display in real-time
+                                combined_logger.log_message(line.rstrip(), "TEST", print_to_console=False)
+
+                            test_process.wait()
+                            test_return_code = test_process.returncode
+
+                            # Read stderr after process completes
+                            stderr_output = test_process.stderr.read()
+                            if stderr_output:
+                                combined_logger.log_message("--- STDERR OUTPUT ---", "TEST")
+                                combined_logger.log_message(stderr_output, "TEST", print_to_console=False)
+                                combined_logger.log_message("--- END STDERR ---", "TEST")
+                                test_output_lines.append("--- STDERR OUTPUT ---")
+                                test_output_lines.extend(stderr_output.strip().split('\n'))
+                                test_output_lines.append("--- END STDERR ---")
+                                print(f"\n[STDERR]\n{stderr_output}")
+
+                            combined_logger.log_message(f"=== test.sh {attempt_msg} completed (return code: {test_return_code}) ===", "SYSTEM")
+
+                            if test_return_code != 0:
+                                combined_logger.log_message(f"WARNING: test.sh exited with non-zero code: {test_return_code}", "WARNING")
+                                success = False
+
+                                # Check if we should retry
+                                if test_attempt <= test_sh_max_retries:
+                                    retry_msg = f"test.sh failed. Will retry... ({test_sh_max_retries - test_attempt + 1} retries remaining)"
+                                    print(f"\n🔄 {retry_msg}")
+                                    combined_logger.log_message(retry_msg, "SYSTEM")
+                                else:
+                                    # All retries exhausted
+                                    final_msg = f"test.sh failed after all {test_sh_max_retries + 1} attempts. No more retries available."
+                                    print(f"\n❌ {final_msg}")
+                                    combined_logger.log_message(final_msg, "ERROR")
+                            else:
+                                # Success!
+                                success = True
+                                print(f"\n✅ test.sh {attempt_msg} completed successfully")
+                                combined_logger.log_message(f"=== test.sh {attempt_msg} SUCCEEDED ===", "SYSTEM")
+                                break  # Exit retry loop on success
+
+                        except Exception as test_error:
+                            import traceback as tb
+                            error_msg = f"ERROR: Exception while running test.sh: {test_error}"
+                            combined_logger.log_message(error_msg, "ERROR")
+                            combined_logger.log_message(f"Traceback: {tb.format_exc()}", "ERROR")
+                            test_output_lines.append(error_msg)
+                            print(f"\n❌ {error_msg}")
                             success = False
-                        else:
-                            success = True
+                            test_return_code = 1
 
-                    except Exception as test_error:
-                        import traceback as tb
-                        error_msg = f"ERROR: Exception while running test.sh: {test_error}"
-                        combined_logger.log_message(error_msg, "ERROR")
-                        combined_logger.log_message(f"Traceback: {tb.format_exc()}", "ERROR")
-                        test_output_lines.append(error_msg)
-                        print(f"\n❌ {error_msg}")
-                        success = False
+                            # Check if we should retry
+                            if test_attempt <= test_sh_max_retries:
+                                retry_msg = f"test.sh exception occurred. Will retry... ({test_sh_max_retries - test_attempt + 1} retries remaining)"
+                                print(f"\n🔄 {retry_msg}")
+                                combined_logger.log_message(retry_msg, "SYSTEM")
+                            else:
+                                # All retries exhausted
+                                final_msg = f"test.sh failed with exceptions after all {test_sh_max_retries + 1} attempts. No more retries available."
+                                print(f"\n❌ {final_msg}")
+                                combined_logger.log_message(final_msg, "ERROR")
 
                 else:
                     error_msg = "ERROR: test.sh not found in implementation directory"
@@ -4619,6 +4923,39 @@ def create_websocket_client(server, token):
                     control_flags['force_ui_update'] = True
                     clamp_event_scroll()
 
+            except KeyboardInterrupt:
+                # User or server requested stop - stop immediately
+                print(f"\n⚠️  Implementation stopped (user/server request)")
+
+                # Set stop flag to ensure clean exit
+                control_flags['stop_requested'] = True
+                control_flags['should_exit'] = True
+
+                # Log the termination
+                task_status['events'].append({
+                    'timestamp': datetime.now().isoformat(),
+                    'type': 'system',
+                    'title': f'🛑 Implementation {idea_id} stopped by termination request'
+                })
+                control_flags['force_ui_update'] = True
+                clamp_event_scroll()
+
+                # Send termination result to backend
+                try:
+                    sio.emit('idea_result', {
+                        'task_id': task_id,
+                        'idea_id': idea_id,
+                        'success': False,
+                        'test_output': 'Implementation stopped by termination request',
+                        'error': 'Task terminated',
+                        'logfile': 'Implementation was terminated before completion'
+                    })
+                except Exception as send_error:
+                    print(f"Warning: Could not send termination result: {send_error}")
+
+                # Don't re-raise - let the function complete normally
+                return
+
             except Exception as e:
                 import traceback
                 error_msg = f"Error executing idea: {e}\n{traceback.format_exc()}"
@@ -4795,9 +5132,13 @@ def create_websocket_client(server, token):
 
 
 def heartbeat_thread(sio, token):
-    """Background thread for sending heartbeats every 30 minutes"""
+    """Background thread for sending heartbeats (interval configurable, default 30 minutes)"""
+    # Get heartbeat interval from config (default: 1800 seconds = 30 minutes)
+    conn_config = get_connection_config()
+    heartbeat_interval = conn_config['heartbeat_interval']
+
     while task_status['connected'] and not control_flags['stop_requested']:
-        time.sleep(1800)  # 30 minutes
+        time.sleep(heartbeat_interval)  # Configurable interval (default: 30 minutes)
         if task_status['connected'] and task_status['task_id']:
             try:
                 task_status['heartbeat_ok'] = False
@@ -4806,7 +5147,8 @@ def heartbeat_thread(sio, token):
                     'token': token
                 })
                 task_status['heartbeat_ok'] = True
-                task_status['heartbeat_next'] = datetime.now() + timedelta(minutes=30)
+                # Calculate next heartbeat time using configured interval (in seconds)
+                task_status['heartbeat_next'] = datetime.now() + timedelta(seconds=heartbeat_interval)
             except:
                 task_status['heartbeat_ok'] = False
 
@@ -7110,7 +7452,9 @@ def submit(codebase_path, token, server, query, gpu, baseline):
         # Start heartbeat thread
         heartbeat_t = threading.Thread(target=heartbeat_thread, args=(sio, token), daemon=True)
         heartbeat_t.start()
-        task_status['heartbeat_next'] = datetime.now() + timedelta(minutes=30)
+        # Set initial heartbeat_next using configured interval (in seconds)
+        conn_config = get_connection_config()
+        task_status['heartbeat_next'] = datetime.now() + timedelta(seconds=conn_config['heartbeat_interval'])
 
         # Start monitoring
         console.print("[bold green]✓ Now monitoring task in real-time[/bold green]")
@@ -7126,7 +7470,7 @@ def submit(codebase_path, token, server, query, gpu, baseline):
 
         def input_listener():
             """Listen for user commands in a separate thread"""
-            while not control_flags['stop_requested'] and not termination_requested.is_set():
+            while not control_flags['stop_requested'] and not termination_requested.is_set() and not control_flags.get('should_exit', False):
                 try:
                     # Use a non-blocking approach with select on Unix-like systems
                     if hasattr(sys.stdin, 'fileno'):
@@ -7155,8 +7499,17 @@ def submit(codebase_path, token, server, query, gpu, baseline):
         try:
             last_update = time.time()
 
-            while not control_flags['stop_requested']:
+            while not control_flags['stop_requested'] and not control_flags['should_exit']:
                 current_time = time.time()
+
+                # Check if server terminated the task
+                if control_flags['should_exit'] or task_status.get('terminated_by_server'):
+                    console.print("\n\n[red]🛑 Task has been terminated by server[/red]")
+                    if task_status.get('termination_message'):
+                        console.print(f"[yellow]{task_status['termination_message']}[/yellow]")
+                    console.print("\n[dim]Exiting to main menu...[/dim]")
+                    time.sleep(2)
+                    break
 
                 # Check if Ctrl+C was pressed in input listener
                 if keyboard_interrupt_flag.is_set():
@@ -7693,7 +8046,9 @@ def monitor_task_impl(task_id, token, server):
         # Start heartbeat
         heartbeat_t = threading.Thread(target=heartbeat_thread, args=(sio, token), daemon=True)
         heartbeat_t.start()
-        task_status['heartbeat_next'] = datetime.now() + timedelta(minutes=30)
+        # Set initial heartbeat_next using configured interval (in seconds)
+        conn_config = get_connection_config()
+        task_status['heartbeat_next'] = datetime.now() + timedelta(seconds=conn_config['heartbeat_interval'])
 
         # Start monitoring
         console.print("[bold green]✓ Now monitoring task in real-time[/bold green]")
@@ -7707,7 +8062,7 @@ def monitor_task_impl(task_id, token, server):
 
         def input_listener():
             """Listen for user commands in a separate thread"""
-            while not control_flags['stop_requested'] and not termination_requested.is_set():
+            while not control_flags['stop_requested'] and not termination_requested.is_set() and not control_flags.get('should_exit', False):
                 try:
                     # Use a non-blocking approach with select on Unix-like systems
                     if hasattr(sys.stdin, 'fileno'):
@@ -7736,8 +8091,17 @@ def monitor_task_impl(task_id, token, server):
         try:
             last_update = time.time()
 
-            while not control_flags['stop_requested']:
+            while not control_flags['stop_requested'] and not control_flags['should_exit']:
                 current_time = time.time()
+
+                # Check if server terminated the task
+                if control_flags['should_exit'] or task_status.get('terminated_by_server'):
+                    console.print("\n\n[red]🛑 Task has been terminated by server[/red]")
+                    if task_status.get('termination_message'):
+                        console.print(f"[yellow]{task_status['termination_message']}[/yellow]")
+                    console.print("\n[dim]Exiting to main menu...[/dim]")
+                    time.sleep(2)
+                    break
 
                 # Check if Ctrl+C was pressed in input listener
                 if keyboard_interrupt_flag.is_set():
@@ -8283,19 +8647,23 @@ def findings(task_id, token, server):
 @click.option('--show', 'action', flag_value='show', default=True, help='Show configuration (default)')
 @click.option('--set', 'action', flag_value='set', help='Set a configuration value')
 @click.option('--reset', 'action', flag_value='reset', help='Reset configuration to defaults')
-@click.option('--key', help='Configuration key to set (install_dir, workspace_dir, default_server, validation_frequency, baseline_upload)')
+@click.option('--key', help='Configuration key (see help for full list)')
 @click.option('--value', help='Configuration value to set')
 def config(action, key, value):
     """Display and manage CLI configuration settings
 
     \b
     Configuration Keys:
-      install_dir           - Installation/config directory path
-      workspace_dir         - Workspace directory path
-      default_server        - Default server URL
-      version              - CLI version (read-only)
-      validation_frequency - Research validation frequency (high/medium/low/auto)
-      baseline_upload      - Baseline upload preference (Y/H/ask)
+      install_dir             - Installation/config directory path
+      workspace_dir           - Workspace directory path
+      default_server          - Default server URL
+      version                 - CLI version (read-only)
+      validation_frequency    - Research validation frequency (high/medium/low/auto)
+      baseline_upload         - Baseline upload preference (Y/H/ask)
+      claude_code_max_retries - Max retries for Claude Code (0-10, default: 2)
+      test_sh_max_retries     - Max retries for test.sh (0-10, default: 1)
+      reconnection_attempts   - WebSocket reconnection attempts (1-1000, default: 400)
+      heartbeat_interval      - Heartbeat interval in seconds (60-7200, default: 1800)
 
     \b
     Research Settings:
@@ -8352,7 +8720,12 @@ def config(action, key, value):
                 console.print(f"[yellow]Warning: Failed to load config: {e}[/yellow]")
 
         # Validate and set the key
-        valid_keys = ['install_dir', 'default_server', 'workspace_dir', 'version', 'validation_frequency', 'baseline_upload']
+        valid_keys = [
+            'install_dir', 'default_server', 'workspace_dir', 'version',
+            'validation_frequency', 'baseline_upload',
+            'claude_code_max_retries', 'test_sh_max_retries',
+            'reconnection_attempts', 'heartbeat_interval'
+        ]
         if key not in valid_keys:
             console.print(f"[red]✗ Error:[/red] Invalid key '{key}'")
             console.print(f"[dim]Valid keys: {', '.join(valid_keys)}[/dim]")
@@ -8378,6 +8751,58 @@ def config(action, key, value):
             save_baseline_upload_default(value.upper())
             console.print(f"[green]✓[/green] Baseline upload preference updated: [cyan]{value.upper()}[/cyan]")
             return
+
+        # Handle retry configuration
+        if key in ['claude_code_max_retries', 'test_sh_max_retries']:
+            try:
+                retry_value = int(value)
+                if retry_value < 0 or retry_value > 10:
+                    console.print(f"[red]✗ Error:[/red] Retry value must be between 0-10")
+                    console.print(f"[dim]Default: claude_code_max_retries=2, test_sh_max_retries=1[/dim]")
+                    sys.exit(1)
+                cli_config = load_cli_config()
+                cli_config[key] = retry_value
+                save_cli_config(cli_config)
+                console.print(f"[green]✓[/green] {key} updated: [cyan]{retry_value}[/cyan] (total {retry_value + 1} attempts)")
+                return
+            except ValueError:
+                console.print(f"[red]✗ Error:[/red] Invalid number: {value}")
+                sys.exit(1)
+
+        # Handle connection configuration
+        if key == 'reconnection_attempts':
+            try:
+                attempts = int(value)
+                if attempts < 1 or attempts > 1000:
+                    console.print(f"[red]✗ Error:[/red] Reconnection attempts must be between 1-1000")
+                    console.print(f"[dim]Default: 400 (approx 1 hour with 10s max delay)[/dim]")
+                    sys.exit(1)
+                max_minutes = (attempts * 10) // 60
+                cli_config = load_cli_config()
+                cli_config['reconnection_attempts'] = attempts
+                save_cli_config(cli_config)
+                console.print(f"[green]✓[/green] Reconnection attempts updated: [cyan]{attempts}[/cyan] (~{max_minutes} minutes max)")
+                return
+            except ValueError:
+                console.print(f"[red]✗ Error:[/red] Invalid number: {value}")
+                sys.exit(1)
+
+        if key == 'heartbeat_interval':
+            try:
+                interval = int(value)
+                if interval < 60 or interval > 7200:
+                    console.print(f"[red]✗ Error:[/red] Heartbeat interval must be between 60-7200 seconds")
+                    console.print(f"[dim]Default: 1800 (30 minutes)[/dim]")
+                    sys.exit(1)
+                minutes = interval // 60
+                cli_config = load_cli_config()
+                cli_config['heartbeat_interval'] = interval
+                save_cli_config(cli_config)
+                console.print(f"[green]✓[/green] Heartbeat interval updated: [cyan]{interval}s[/cyan] ({minutes} minutes)")
+                return
+            except ValueError:
+                console.print(f"[red]✗ Error:[/red] Invalid number: {value}")
+                sys.exit(1)
 
         # Special handling for install_dir
         if key == 'install_dir':
@@ -8425,6 +8850,33 @@ def config(action, key, value):
                 cli_config.pop('baseline_upload', None)
                 save_cli_config(cli_config)
                 console.print(f"[green]✓[/green] Reset baseline_upload: {old_value} → ask (default)")
+                return
+
+            # Handle retry settings reset
+            if key in ['claude_code_max_retries', 'test_sh_max_retries']:
+                cli_config = load_cli_config()
+                defaults = {'claude_code_max_retries': 2, 'test_sh_max_retries': 1}
+                old_value = cli_config.get(key, defaults[key])
+                cli_config.pop(key, None)
+                save_cli_config(cli_config)
+                console.print(f"[green]✓[/green] Reset {key}: {old_value} → {defaults[key]} (default)")
+                return
+
+            # Handle connection settings reset
+            if key == 'reconnection_attempts':
+                cli_config = load_cli_config()
+                old_value = cli_config.get('reconnection_attempts', 400)
+                cli_config.pop('reconnection_attempts', None)
+                save_cli_config(cli_config)
+                console.print(f"[green]✓[/green] Reset reconnection_attempts: {old_value} → 400 (default, ~1 hour)")
+                return
+
+            if key == 'heartbeat_interval':
+                cli_config = load_cli_config()
+                old_value = cli_config.get('heartbeat_interval', 1800)
+                cli_config.pop('heartbeat_interval', None)
+                save_cli_config(cli_config)
+                console.print(f"[green]✓[/green] Reset heartbeat_interval: {old_value}s → 1800s (default, 30 minutes)")
                 return
 
             # Handle install config settings
@@ -8566,6 +9018,22 @@ def config(action, key, value):
     config_table.add_row("🔍 Validation Frequency", freq_display)
     config_table.add_row("📤 Baseline Upload", baseline_display)
 
+    # Retry settings
+    retry_config = get_retry_config()
+    claude_code_retries = retry_config.get('claude_code_max_retries', 2)
+    test_sh_retries = retry_config.get('test_sh_max_retries', 1)
+    config_table.add_row("🔄 Claude Code Max Retries", f"{claude_code_retries} (total {claude_code_retries + 1} attempts)")
+    config_table.add_row("🔄 Test.sh Max Retries", f"{test_sh_retries} (total {test_sh_retries + 1} attempts)")
+
+    # Connection settings
+    conn_config = get_connection_config()
+    reconnection_attempts = conn_config.get('reconnection_attempts', 400)
+    heartbeat_interval = conn_config.get('heartbeat_interval', 1800)
+    max_reconnect_minutes = (reconnection_attempts * 10) // 60
+    heartbeat_minutes = heartbeat_interval // 60
+    config_table.add_row("🔌 Reconnection Attempts", f"{reconnection_attempts} (~{max_reconnect_minutes} minutes max)")
+    config_table.add_row("💓 Heartbeat Interval", f"{heartbeat_interval}s ({heartbeat_minutes} minutes)")
+
     # Last login
     last_login = cli_config.get('last_login_at', 'Never')
     config_table.add_row("", "")  # Separator
@@ -8581,7 +9049,7 @@ def config(action, key, value):
     console.print("  • Reset:  [cyan]deepscientist-cli config --reset [--key <KEY>][/cyan]")
     console.print("  • Help:   [cyan]deepscientist-cli config --help[/cyan]")
     console.print()
-    console.print("  [dim]Valid keys: install_dir, workspace_dir, default_server, validation_frequency, baseline_upload[/dim]")
+    console.print("  [dim]Valid keys: install_dir, workspace_dir, default_server, validation_frequency, baseline_upload, claude_code_max_retries, test_sh_max_retries, reconnection_attempts, heartbeat_interval[/dim]")
     console.print()
 
     console.print("[bold]🔍 Research Settings Configuration:[/bold]")
@@ -8597,9 +9065,28 @@ def config(action, key, value):
     console.print("    [cyan]deepscientist-cli config --set --key baseline_upload --value Y[/cyan]")
     console.print("    [dim]Options: Y (always), H (already uploaded), ask (prompt each time)[/dim]")
     console.print()
+    console.print("    # Set retry configuration")
+    console.print("    [cyan]deepscientist-cli config --set --key claude_code_max_retries --value 3[/cyan]")
+    console.print("    [dim]Options: 0-10 (default: 2, total attempts = retries + 1)[/dim]")
+    console.print("    [cyan]deepscientist-cli config --set --key test_sh_max_retries --value 2[/cyan]")
+    console.print("    [dim]Options: 0-10 (default: 1, total attempts = retries + 1)[/dim]")
+    console.print()
+    console.print("  [bold yellow]To Change Connection Settings:[/bold yellow]")
+    console.print("    # Set reconnection attempts")
+    console.print("    [cyan]deepscientist-cli config --set --key reconnection_attempts --value 600[/cyan]")
+    console.print("    [dim]Options: 1-1000 (default: 400, ~67 minutes max with 10s delay)[/dim]")
+    console.print("    # Set heartbeat interval")
+    console.print("    [cyan]deepscientist-cli config --set --key heartbeat_interval --value 3600[/cyan]")
+    console.print("    [dim]Options: 60-7200 seconds (default: 1800, 30 minutes)[/dim]")
+    console.print()
     console.print("    # Reset to defaults")
     console.print("    [cyan]deepscientist-cli config --reset --key validation_frequency[/cyan]")
     console.print("    [cyan]deepscientist-cli config --reset --key baseline_upload[/cyan]")
+    console.print("    [cyan]deepscientist-cli config --reset --key claude_code_max_retries[/cyan]")
+    console.print("    [cyan]deepscientist-cli config --reset --key reconnection_attempts[/cyan]")
+    console.print()
+    console.print("    # Reset ALL settings to defaults")
+    console.print("    [cyan]deepscientist-cli config --reset[/cyan]")
     console.print()
 
     console.print("[bold]🔐 Authentication:[/bold]")
