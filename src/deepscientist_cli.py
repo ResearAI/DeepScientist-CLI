@@ -3425,8 +3425,8 @@ def validate_codebase(codebase_path: str) -> dict:
 
             console.print(f"[{color}]  ✓[/{color}] gitingest tokens: {token_count:,} ({status})")
 
-            if token_count >= 50000:
-                console.print(f"\n[red]  ✗ Error:[/red] Token count ({token_count:,}) exceeds limit (50,000)")
+            if token_count >= 80000:
+                console.print(f"\n[red]  ✗ Error:[/red] Token count ({token_count:,}) exceeds limit (80,000)")
                 console.print("[yellow]  💡 Hint:[/yellow] Create a `.ep` file in your project root with patterns to exclude large assets (datasets, checkpoints, logs) and retry. Example: \n  ['data/*', '*.pt', '*.csv']")
                 return None
 
