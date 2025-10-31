@@ -8,7 +8,7 @@
 
 The DeepScientist CLI empowers researchers to harness the full potential of autonomous scientific discovery without the prohibitive setup overhead. It democratizes access to the state-of-the-art DeepScientist system by encapsulating its complex operational requirements into intuitive commands. This tool is designed to accelerate the research lifecycle, allowing users to seamlessly submit tasks, monitor progress, and iterate on ideas at a scale previously reserved for highly specialized teams.
 
-The current public release is v0.2.1, and the bundled backend handshake checks the same version to keep the CLI and server in sync.
+The current public release is v0.3.2, and the bundled backend handshake checks the same version to keep the CLI and server in sync.
 
 ## Prerequisites
 
@@ -85,7 +85,7 @@ The installer performs the following steps (mirroring `install_cli.sh`):
    - If verification succeeds, the script automatically runs `deepscientist_cli.py login` so your token is saved in `~/.deepscientist/cli_config.json`.  
    - Supported (institutional) users are asked whether to use DeepScientist-provided Claude Code resources or their own Anthropic API key. Normal users default to local configuration.
 5. Installs Claude Code tooling via `src/claude_code_deepscientist_env.sh`, configuring the appropriate API endpoint when DeepScientist resources are selected.
-6. Writes installation metadata (including version `v0.2.1`) to both the installation directory and `~/.deepscientist/config.json`.
+6. Writes installation metadata (including version `v0.3.2`) to both the installation directory and `~/.deepscientist/config.json`.
 7. Appends the installation paths to your shell profile (`.bashrc` or `.zshrc`) if they are not already present.
 8. Reminds you at completion that you can launch the CLI with `deepscientist-cli` or `ds-cli`.
 
@@ -96,7 +96,7 @@ The installation script automatically:
 2. Installs the Claude Code CLI (`@anthropic-ai/claude-code`) and optionally binds it to DeepScientist endpoints.
 3. Installs Python dependencies found in `requirements.txt` (inside Conda if active, otherwise under the current user).
 4. Generates wrapper commands (`deepscientist-cli`, `deepscientist`, `ds-cli`) and symlinks them into both `~/.local/bin` and `~/.deepscientist/bin`, overwriting any stale wrappers from previous installs.
-5. Persists configuration files describing the install path, bin directory, and CLI version (`v0.2.1`).
+5. Persists configuration files describing the install path, bin directory, and CLI version (`v0.3.2`).
 
 ### Verify Installation
 
