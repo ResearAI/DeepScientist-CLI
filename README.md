@@ -4,17 +4,11 @@
 
 ⚠️ **This CLI is intended only for users who already hold a valid DeepScientist API token from http://deepscientist.cc.**
 
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=OJodfU__Buk">
-    <img src="img/ds-cli.png" alt="Watch the video">
-  </a>
-</p>
-
 ## Overview
 
 The DeepScientist CLI empowers researchers to harness the full potential of autonomous scientific discovery without the prohibitive setup overhead. It democratizes access to the state-of-the-art DeepScientist system by encapsulating its complex operational requirements into intuitive commands. This tool is designed to accelerate the research lifecycle, allowing users to seamlessly submit tasks, monitor progress, and iterate on ideas at a scale previously reserved for highly specialized teams.
 
-
+The current public release is v0.2.1, and the bundled backend handshake checks the same version to keep the CLI and server in sync.
 
 ## Prerequisites
 
@@ -91,7 +85,7 @@ The installer performs the following steps (mirroring `install_cli.sh`):
    - If verification succeeds, the script automatically runs `deepscientist_cli.py login` so your token is saved in `~/.deepscientist/cli_config.json`.  
    - Supported (institutional) users are asked whether to use DeepScientist-provided Claude Code resources or their own Anthropic API key. Normal users default to local configuration.
 5. Installs Claude Code tooling via `src/claude_code_deepscientist_env.sh`, configuring the appropriate API endpoint when DeepScientist resources are selected.
-6. Writes installation metadata (including version `v0.3.0`) to both the installation directory and `~/.deepscientist/config.json`.
+6. Writes installation metadata (including version `v0.2.1`) to both the installation directory and `~/.deepscientist/config.json`.
 7. Appends the installation paths to your shell profile (`.bashrc` or `.zshrc`) if they are not already present.
 8. Reminds you at completion that you can launch the CLI with `deepscientist-cli` or `ds-cli`.
 
@@ -132,19 +126,24 @@ claude --version
 Use the CLI immediately after installation:
 
 ```bash
-# Submit research task
-conda run -n <ENV_NAME> ds-cli submit /path/to/your/project \
+# Launch the interactive CLI shell
+ds-cli
+
+# Now you are inside the CLI prompt. Execute commands below:
+
+# Submit research task (monitoring starts automatically after submission)
+submit /path/to/your/project \
   --query "Focus on <limitations/methods/objectives>" \
   --gpu 0
 
-# Monitor task progress
-ds-cli monitor <TASK_ID>
-
 # List all tasks
-ds-cli list
+list
+
+# View research findings
+findings <TASK_ID>
 
 # Stop tasks (interactive - will prompt Y/N)
-ds-cli stop
+stop
 ```
 
 ## Prepare Your Research Project
@@ -157,24 +156,51 @@ Your research project should include:
 
 ## Available Commands
 
+### Getting Started
+
+1. **Launch the interactive CLI shell:**
+   ```bash
+   ds-cli
+   ```
+
+2. **Inside the CLI shell, you can run the following commands** (without `ds-cli` prefix):
+
 ### Basic Commands
 
-- `conda run -n <ENV_NAME> ds-cli submit <path> --query "Focus on <limitations/methods/objectives>" --gpu <ID>` - Submit a research task with a clear research directive and selected GPU device
-- `ds-cli monitor <task_id>` - Monitor task progress in real-time
-- `ds-cli list` - List all your tasks
-- `ds-cli findings <task_id>` - View research findings
-- `ds-cli login` - Configure server connection (Option 2 users)
-- `ds-cli --help` - Show all available commands
+- `login --token YOUR_TOKEN` - Authenticate and save server configuration (required for Option 2 users)
+- `submit <path> --query "Focus on <limitations/methods/objectives>" --gpu <ID>` - Submit a research task (automatically starts monitoring)
+- `list` - List all your tasks
+- `findings <task_id>` - View research findings for a specific task
+- `stop` - Stop running tasks (interactive mode with confirmation)
+- `config` - View or modify CLI configuration settings
+- `help` or `?` - Show available commands
+- `exit` or `quit` - Exit the interactive shell
+
+### Additional Commands
+
+- `verify-api` - Verify API configuration and connectivity
+- `whoami` - Display current user information
+- `status` - Check system health and connection status
+- `export <task_id>` - Export task data in various formats
+- `stats` - View usage statistics and analytics
+- `pause <task_id>` - Pause a running task
+- `resume <task_id>` - Resume a paused task
+- `delete <task_id>` - Delete a task (requires confirmation)
+- `feedback "message"` - Submit feedback to the platform
+
+**Note:** Task monitoring happens automatically after submission. You don't need a separate monitor command.
 
 ### Task Control Commands
 
 #### Stop Running Tasks
 
-The `stop` command allows you to terminate running tasks individually or all at once:
+The `stop` command allows you to terminate running tasks individually or all at once.
+
+**Usage (from inside the CLI shell):**
 
 **Interactive mode (recommended):**
 ```bash
-ds-cli stop
+stop
 ```
 When you run `stop` without arguments, the CLI will ask if you want to stop all tasks:
 - Enter `Y` (Yes) to stop all active tasks
@@ -182,24 +208,29 @@ When you run `stop` without arguments, the CLI will ask if you want to stop all 
 
 **Stop a specific task:**
 ```bash
-ds-cli stop --task <task_id>
+stop --task <task_id>
 ```
 
 **Stop all active tasks (non-interactive):**
 ```bash
-ds-cli stop --all
+stop --all
 ```
 
 **Examples:**
 ```bash
+# Launch the CLI shell first
+ds-cli
+
+# Then inside the CLI prompt:
+
 # Interactive mode - CLI will prompt for confirmation
-ds-cli stop
+stop
 
 # Stop a specific task by its ID
-ds-cli stop --task 4036e2ef-be65-4aa5-ae50-f54cdf148713
+stop --task 4036e2ef-be65-4aa5-ae50-f54cdf148713
 
 # Stop all currently running, queued, or paused tasks (skip prompt)
-ds-cli stop --all
+stop --all
 ```
 
 **Features:**
@@ -215,7 +246,7 @@ ds-cli stop --all
 - Only active tasks (queued, started, running, paused) will be stopped
 - The backend will send confirmation via WebSocket events
 - Tasks are marked as 'terminated' in the database
-- Use `ds-cli list` to view all your tasks and their IDs
+- Use `list` to view all your tasks and their IDs
 
 
 ## Getting Help
